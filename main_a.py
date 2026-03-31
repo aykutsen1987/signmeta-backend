@@ -90,7 +90,7 @@ Coordinates:
 Return ONLY the interpreted text."""
 
         completion = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_message}
@@ -117,7 +117,7 @@ SIGNS: SIGN1, SIGN2, SIGN3
 DESCRIPTION: brief description"""
 
         completion = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a sign language expert."},
                 {"role": "user", "content": prompt}
