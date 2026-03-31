@@ -1,15 +1,8 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import os
-import base64
-import numpy as np
-from PIL import Image
-import io
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
 
 app = FastAPI(title="SignMeta Backend - GROUP A", version="1.0.0")
 
@@ -20,16 +13,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# MediaPipe Hand Landmarker - using bundled model
-_base_options = python.BaseOptions(model_asset_path="assets/hand_landmarker.task")
-_options = vision.HandLandmarkerOptions(base_options=_base_options, num_hands=2)
-_hand_landmarker = None
-
-def get_hand_landmarker():
-    global _hand_landmarker
-    if _hand_landmarker is None:
-        _hand_landmarker = vision.HandLandmarker.create_from_options(_options)
-    return _hand_landmarker
+# Konfigürasyon
+USE_GROQ = os.environ.get("USE_GROQ", "true").lower() == "true"
+USE_OLLAMA = os.environ.get("USE_OLLAMA", "true").lower() == "true"
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
 
 SYSTEM_PROMPT = """Sen uzman bir İşaret Dili yorumcususun.
 Görevini:
@@ -49,6 +37,61 @@ def get_groq_client():
         )
     from groq import Groq
     return Groq(api_key=api_key)
+
+def call_ollama(prompt: str) -> str:
+    import requests
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                "stream": False
+            },
+            timeout=30
+        )
+        if response.status_code != 200:
+            raise Exception(f"Ollama error: {response.text}")
+        return response.json()["message"]["content"]
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Ollama bağlantı hatası: {str(e)}")
+
+def call_groq(prompt: str) -> str:
+    client = get_groq_client()
+    completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        max_tokens=256,
+    )
+    return completion.choices[0].message.content.strip()
+
+def translate_with_ai(coordinates_text: str) -> str:
+    """Önce Ollama dene, başarısız olursa Groq'a geç"""
+    
+    if USE_OLLAMA:
+        try:
+            result = call_ollama(coordinates_text)
+            if result and len(result) > 0:
+                return result
+        except Exception as e:
+            print(f"Ollama failed: {e}")
+    
+    if USE_GROQ:
+        try:
+            result = call_groq(coordinates_text)
+            if result and len(result) > 0:
+                return result
+        except Exception as e:
+            print(f"Groq failed: {e}")
+    
+    return "Anlaşılamadı"
 
 class Landmark(BaseModel):
     x: float
@@ -80,22 +123,40 @@ class TextToSignResponse(BaseModel):
     description: str
     served_by: str = "A"
 
-class ImageRequest(BaseModel):
-    image: str  # base64 encoded
-    language: Optional[str] = "tr"
-
 @app.get("/")
 def root():
-    return {"status": "SignMeta Backend GROUP-A Running", "group": "A", "version": "1.0.0", "mode": "server-side-mediapipe"}
+    return {
+        "status": "SignMeta Backend GROUP-A Running",
+        "group": "A",
+        "version": "1.0.0",
+        "ollama": USE_OLLAMA,
+        "groq": USE_GROQ
+    }
 
 @app.get("/health")
 def health():
-    groq_configured = bool(os.environ.get("GROQ_API_KEY"))
-    return {"status": "ok", "group": "A", "groq_configured": groq_configured}
+    import requests
+    ollama_ok = False
+    if USE_OLLAMA:
+        try:
+            resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+            ollama_ok = resp.status_code == 200
+        except:
+            pass
+    
+    groq_ok = False
+    if USE_GROQ:
+        groq_ok = bool(os.environ.get("GROQ_API_KEY"))
+    
+    return {
+        "status": "ok",
+        "group": "A",
+        "ollama_available": ollama_ok,
+        "groq_configured": groq_ok
+    }
 
 @app.post("/translate", response_model=TranslateResponse)
 async def translate_sign(request: TranslateRequest):
-    client = get_groq_client()
     try:
         coord_text = ""
         for i, hand in enumerate(request.hands):
@@ -110,97 +171,21 @@ Koordinatlar:
 {coord_text}
 Sadece yorumlanmış metni döndür."""
 
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=0.3,
-            max_tokens=256,
-        )
-        result = completion.choices[0].message.content.strip()
-        return TranslateResponse(text=result, confidence=0.85, language=request.language, served_by="A")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Groq API hatası: {str(e)}")
-
-@app.post("/process-image", response_model=TranslateResponse)
-async def process_image(request: ImageRequest):
-    """Görüntüyü al, el landmarks tespit et, Groq ile yorumla"""
-    try:
-        # Base64 image to PIL Image
-        image_data = base64.b64decode(request.image)
-        image = Image.open(io.BytesIO(image_data)).convert("RGB")
-        
-        # Convert to numpy array for MediaPipe
-        np_image = np.array(image)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np_image)
-        
-        # Detect hand landmarks
-        detector = get_hand_landmarker()
-        result = detector.detect(mp_image)
-        
-        if not result or not result.hand_landmarks:
-            return TranslateResponse(
-                text="El tespit edilemedi",
-                confidence=0.0,
-                language=request.language or "tr",
-                served_by="A"
-            )
-        
-        # Convert to HandData format
-        hands = []
-        for idx, landmarks in enumerate(result.hand_landmarks):
-            hand_type = "Right" if result.handedness[idx][0].category_name == "Right" else "Left"
-            landmark_list = [
-                Landmark(x=lm.x, y=lm.y, z=lm.z) 
-                for lm in landmarks
-            ]
-            hands.append(HandData(landmarks=landmark_list, handedness=hand_type))
-        
-        # Send to Groq for interpretation
-        client = get_groq_client()
-        coord_text = ""
-        for i, hand in enumerate(hands):
-            hand_type = "Sağ" if hand.handedness == "Right" else "Sol"
-            coord_text += f"\nEl {i+1} ({hand_type}):\n"
-            for j, lm in enumerate(hand.landmarks):
-                coord_text += f"  Nokta {j}: x={lm.x:.4f}, y={lm.y:.4f}, z={lm.z:.4f}\n"
-        
-        user_message = f"""Bu el koordinatlarını işaret dili olarak yorumla.
-Hedef dil: {'Türkçe' if request.language == 'tr' else 'İngilizce'}
-Koordinatlar:
-{coord_text}
-Sadece yorumlanmış metni döndür."""
-
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=0.3,
-            max_tokens=256,
-        )
-        result_text = completion.choices[0].message.content.strip()
+        result = translate_with_ai(user_message)
         
         return TranslateResponse(
-            text=result_text,
+            text=result.strip(),
             confidence=0.85,
-            language=request.language or "tr",
+            language=request.language,
             served_by="A"
         )
-        
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Görüntü işleme hatası: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Yorumlama hatası: {str(e)}")
 
 @app.post("/text-to-sign", response_model=TextToSignResponse)
 async def text_to_sign(request: TextToSignRequest):
-    client = get_groq_client()
     try:
         prompt = f"""Bu metni işaret dili animasyon komutlarına çevir.
 Metin: "{request.text}"
@@ -209,16 +194,19 @@ Format:
 İŞARETLER: İŞARET1, İŞARET2, İŞARET3
 AÇIKLAMA: kısa açıklama"""
 
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Sen işaret dili uzmanısın."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=512,
-        )
-        content = completion.choices[0].message.content.strip()
+        if USE_OLLAMA:
+            try:
+                content = call_ollama(prompt)
+            except:
+                if USE_GROQ:
+                    content = call_groq(prompt)
+                else:
+                    content = "İŞARETLER: AÇIKLAMA: Metin dönüştürülemedi"
+        elif USE_GROQ:
+            content = call_groq(prompt)
+        else:
+            content = "İŞARETLER: AÇIKLAMA: Yapay zeka yapılandırılmamış"
+        
         signs = []
         description = content
         for line in content.split("\n"):
@@ -226,11 +214,12 @@ AÇIKLAMA: kısa açıklama"""
                 signs = [s.strip() for s in line.replace("İŞARETLER:", "").replace("SIGNS:", "").split(",")]
             elif "AÇIKLAMA:" in line or "DESCRIPTION:" in line.upper():
                 description = line.replace("AÇIKLAMA:", "").replace("DESCRIPTION:", "").strip()
+                
         return TextToSignResponse(animation_sequence=signs, description=description, served_by="A")
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Groq API hatası: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Metin dönüşüm hatası: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
