@@ -2,7 +2,9 @@ services:
   - type: web
     name: signmeta-backend-a
     env: python
-    buildCommand: pip install -r requirements.txt
+    runtime: python
+    pythonVersion: "3.12.9"
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: uvicorn main_a:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GROQ_API_KEY
