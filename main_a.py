@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import os
-from groq import Groq
 
 app = FastAPI(title="SignMeta Backend - GROUP A", version="1.0.0")
 
@@ -13,8 +12,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 SYSTEM_PROMPT = """You are an expert Sign Language interpreter.
 You receive hand landmark coordinates (21 points per hand, x/y/z) from MediaPipe.
@@ -26,6 +23,16 @@ Your task:
 5. Be concise. Return ONLY the interpreted text, nothing else.
 If coordinates are unclear, return: "Anlaşılamadı / Not understood"
 """
+
+def get_groq_client():
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="GROQ_API_KEY ortam değişkeni ayarlanmamış. Lütfen Render panosundan API anahtarını ekleyin."
+        )
+    from groq import Groq
+    return Groq(api_key=api_key)
 
 class Landmark(BaseModel):
     x: float
@@ -63,10 +70,12 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "group": "A"}
+    groq_configured = bool(os.environ.get("GROQ_API_KEY"))
+    return {"status": "ok", "group": "A", "groq_configured": groq_configured}
 
 @app.post("/translate", response_model=TranslateResponse)
 async def translate_sign(request: TranslateRequest):
+    client = get_groq_client()
     try:
         coord_text = ""
         for i, hand in enumerate(request.hands):
@@ -91,11 +100,14 @@ Return ONLY the interpreted text."""
         )
         result = completion.choices[0].message.content.strip()
         return TranslateResponse(text=result, confidence=0.85, language=request.language, served_by="A")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Groq API hatası: {str(e)}")
 
 @app.post("/text-to-sign", response_model=TextToSignResponse)
 async def text_to_sign(request: TextToSignRequest):
+    client = get_groq_client()
     try:
         prompt = f"""Convert this text to sign language animation commands.
 Text: "{request.text}"
@@ -122,5 +134,7 @@ DESCRIPTION: brief description"""
             elif line.startswith("DESCRIPTION:"):
                 description = line.replace("DESCRIPTION:", "").strip()
         return TextToSignResponse(animation_sequence=signs, description=description, served_by="A")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Groq API hatası: {str(e)}")
